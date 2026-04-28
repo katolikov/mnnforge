@@ -1,0 +1,5 @@
+onnx>=1.14
+onnxruntime>=1.16
+flatbuffers>=23.0
+numpy
+networkx>=3.0
