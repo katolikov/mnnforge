@@ -171,7 +171,63 @@ out = F.convert(net.forward([v])[0], F.NCHW).read()
 print("max abs err:", float(np.abs(ref - out).max()))
 ```
 
-Tolerable max-abs-err on fp32 is typically `1e-3` to `5e-3`.
+Tolerable max-abs-err on fp32 is typically `1e-3` to `5e-3` against ORT.
+
+### Bit-exact: optimized.mnn vs original.mnn
+
+The stronger guarantee mnnforge gives is **bit-exact equivalence between
+`original.mnn` and `optimized.mnn` when both run on MNN at `precision=high`
+(fp32)**. This holds because:
+
+1. The OpenCL float intrinsics in our generated kernels (`native_recip`,
+   `native_exp`, `native_sqrt`, GELU polynomial, …) are byte-identical to
+   the snippets in MNN's stock `unary.cl`/`binary.cl`. There's a unit test
+   that asserts this against the live `unary.cl`
+   (`tests/test_mnn_emit.py::test_kernel_uses_same_intrinsics_as_mnn_unary_cl`).
+2. We preserve the original op order — chains are extended only forward,
+   never reordered.
+3. fp32 IEEE-754 ops on the same lane values are deterministic regardless
+   of whether the intermediate float4 lives in registers or round-trips
+   through Image2D.
+
+Bit-exact verification:
+
+```python
+import numpy as np, MNN
+import MNN.expr as F
+
+inputs = {"x": np.random.randn(1, 3, 224, 224).astype(np.float32)}
+
+def run(mnn_path):
+    rt  = MNN.nn.create_runtime_manager(({"backend": 3,
+                                           "precision": "high"},))
+    net = MNN.nn.load_module_from_file(mnn_path, ["x"], ["y"],
+                                        runtime_manager=rt)
+    v = F.placeholder(list(inputs["x"].shape), F.NCHW); v.write(inputs["x"])
+    return np.array(F.convert(net.forward([v])[0], F.NCHW).read(), copy=True)
+
+a = run("model.original.mnn")
+b = run("model.fused.mnn")
+
+# Bit-exact: every float lane must compare equal under .view('uint32').
+assert (a.view(np.uint32) == b.view(np.uint32)).all(), \\
+       f"max abs diff: {np.abs(a - b).max()}"
+print("bit-exact ✓")
+```
+
+Caveats:
+
+* **Precision mode matters.** `precision=low`/`precision=normal` use fp16
+  storage; bit-exact is impossible because Image2D fp16 round-trips lose
+  precision that registers preserve. Use `precision=high` for the
+  guarantee.
+* **GPU vendors matter.** Intel and Adreno drivers occasionally differ on
+  `native_*` rounding. Bit-exact holds within a single driver; cross-vendor
+  comparisons may show ULP-level drift.
+* **Approximate intrinsics inside chains.** `native_exp`/`native_log` are
+  vendor-implementation-defined. If you need cross-vendor reproducibility
+  rather than within-device bit-exact, swap to the slower precise versions
+  (`exp`, `log`) by editing your `mnnforge_<fp>.cl` file before building MNN.
 
 ---
 
@@ -216,6 +272,22 @@ This:
 ---
 
 ## 10. Troubleshooting
+
+### `These Op Not Support: ONNX::MnnForge_<fp> | …  Converted Failed!`
+This is MNN's `writeFb.cpp` rejecting `OpType_Extra` ops whose
+`engine != "MNN"`. Two fixes:
+
+1. **Permanent (recommended)** — re-run `python -m mnnforge /path/to/MNN`,
+   which writes
+   `tools/converter/source/onnx/MnnForgeOnnx.cpp`. Rebuild MNN. The new
+   converter sets `engine="MNN"` so MNNConvert accepts the ops without any
+   extra flag. Versions ≥ 0.2.1 emit this file automatically.
+2. **One-shot workaround** — pass `--allowCustomOp` to MNNConvert:
+   ```bash
+   ./MNNConvert --allowCustomOp -f ONNX --modelFile model.optimized.onnx \\
+                --MNNModel model.mnn --bizCode mnn
+   ```
+   This bypasses the engine check globally.
 
 ### `cmake not found in PATH`
 Install CMake (`brew install cmake` / `apt install cmake`).

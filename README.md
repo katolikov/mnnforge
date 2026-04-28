@@ -125,7 +125,12 @@ source/backend/opencl/execution/image/MnnForge<Fp>Execution.hpp
 source/backend/opencl/execution/image/MnnForge<Fp>Execution.cpp
 source/backend/opencl/execution/image/FuseExecution.cpp         (patched)
 source/backend/opencl/execution/image/FuseExecution.cpp.mnnforge.bak
+tools/converter/source/onnx/MnnForgeOnnx.cpp                    (ONNX→MNN converter)
 ```
+
+The auto-generated `MnnForgeOnnx.cpp` registers an ONNX→MNN converter for
+each `MnnForge_<fp>` op type with `engine="MNN"` so `MNNConvert` accepts
+the optimized ONNX without `--allowCustomOp`.
 
 Then **you** build MNN and convert the optimized ONNX:
 
@@ -199,9 +204,16 @@ unknown to ORT). What it does verify:
 4. Graph output names are unchanged between canonical and optimized.
 5. Each emitted custom-op node has the expected attributes and tensor connections.
 
-**End-to-end numerical equivalence (your ONNX vs the resulting `.mnn` on OpenCL) is your
-job after building MNN and running MNNConvert.** A ready-made script for that is in the
-HOWTO.
+**Bit-exact within MNN** (precision=high, fp32): `original.mnn` and
+`optimized.mnn` produce byte-identical output tensors when run on the
+same OpenCL device. This holds because our generated kernels use the
+same `native_*` intrinsics MNN's stock `unary.cl`/`binary.cl` use
+(verified by a unit test) and we never reorder ops within a chain.
+See **[HOWTO.md §7](./HOWTO.md#7-verify-end-to-end)** for the
+verification script.
+
+End-to-end numerical equivalence vs ORT (which uses different math
+libraries) is in the `1e-3` to `5e-3` max-abs-error range on fp32.
 
 ---
 
