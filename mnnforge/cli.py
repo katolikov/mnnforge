@@ -1,49 +1,67 @@
-"""mnnforge CLI driver."""
+"""mnnforge CLI driver — ONNX-side flow.
+
+Usage:
+    python -m mnnforge <mnn_root> <model.onnx> [options]
+
+Phases:
+  0 preflight            (validate inputs)
+  1 canonicalize         (model.canon.onnx)
+  2 FSM on ONNX graph
+  3 kernel synthesis
+  4 emit into MNN tree   (.cl + Execution.{hpp,cpp} + FuseExecution.cpp dispatch)
+  5 rewrite ONNX         (model.optimized.onnx with MnnForge_<fp> custom nodes)
+  6 structural verify    (ORT round-trip on canonical, schema check on optimized)
+"""
 from __future__ import annotations
 import argparse
 import os
-import sys
 from typing import List, Optional
+
+import onnx
 
 from . import __version__
 from .log import Logger
 from .preflight import run as preflight_run
 from .canonicalize import canonicalize
-from .convert import ensure_converter, convert as mnn_convert
-from .mnn_fbs import load_mnn, save_mnn
-from .fsm import mine
-from .surgery import apply_patterns
-from .verify import verify
+from .onnx_fsm import mine
+from .onnx_surgery import rewrite_onnx
+from .mnn_emit import emit_all, rollback as mnn_rollback
+from .verify import verify_structural
 
 
 def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mnnforge",
         description=(
-            "ONNX→MNN custom-op fusion for the OpenCL backend. "
-            "Mines repeated elementwise op chains and replaces them with "
-            "single OpType_Extra ops carrying runtime-compiled OpenCL kernels."
+            "ONNX→MNN custom-op fusion. Mines repeated elementwise op "
+            "chains in your ONNX, emits OpenCL kernels + Execution classes "
+            "into the MNN source tree, and rewrites the ONNX so MNNConvert "
+            "produces a .mnn that uses them."
         ),
     )
     p.add_argument("mnn_root", help="path to MNN source tree")
-    p.add_argument("onnx", help="path to input .onnx model")
+    p.add_argument("onnx", nargs="?", help="path to input .onnx model "
+                                          "(omit when using --rollback)")
     p.add_argument("--workdir", default=None,
-                   help="working directory for intermediate files (default: alongside model)")
+                   help="dir for ONNX outputs (default: alongside model)")
     p.add_argument("--top-n", type=int, default=4,
                    help="max number of fused patterns (default 4)")
     p.add_argument("--max-pattern-size", type=int, default=6,
                    help="max chain length for FSM (default 6)")
-    p.add_argument("--atol", type=float, default=1e-3)
-    p.add_argument("--rtol", type=float, default=1e-3)
     p.add_argument("--skip-canonicalize", action="store_true")
-    p.add_argument("--skip-fuse", action="store_true",
-                   help="convert + verify only, no fusion")
+    p.add_argument("--skip-emit", action="store_true",
+                   help="don't write into MNN tree (analysis only)")
+    p.add_argument("--skip-rewrite", action="store_true",
+                   help="don't write the optimized ONNX")
     p.add_argument("--skip-verify", action="store_true")
     p.add_argument("--no-ort-verify-canon", action="store_true",
-                   help="skip ORT verification inside Phase 1 canonicalize "
-                        "(faster; relies on Phase 7 instead)")
+                   help="skip per-pass ORT verification in canonicalize")
+    p.add_argument("--rollback", action="store_true",
+                   help="restore FuseExecution.cpp from backup, "
+                        "remove generated files, and exit")
     p.add_argument("--verbose", "-v", action="store_true")
-    p.add_argument("--version", action="version", version=f"mnnforge {__version__}")
+    p.add_argument("--version", action="version",
+                   version=f"mnnforge {__version__}")
     return p
 
 
@@ -52,8 +70,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     log = Logger(verbose=args.verbose)
     log.info(f"mnnforge {__version__}")
 
-    pre = preflight_run(args.mnn_root, args.onnx, log)
+    if args.rollback:
+        if not os.path.isdir(args.mnn_root):
+            log.err(f"mnn_root invalid: {args.mnn_root}")
+            return 1
+        n = mnn_rollback(args.mnn_root, log)
+        log.ok(f"rollback complete ({n} file(s) removed)")
+        return 0
 
+    if not args.onnx:
+        log.err("onnx path required (or use --rollback)")
+        return 1
+
+    pre = preflight_run(args.mnn_root, args.onnx, log)
     base = os.path.splitext(os.path.basename(pre.onnx_path))[0]
     workdir = (os.path.realpath(args.workdir) if args.workdir
                else os.path.dirname(pre.onnx_path) or ".")
@@ -61,59 +90,62 @@ def main(argv: Optional[List[str]] = None) -> int:
     log.info(f"workdir: {workdir}")
 
     canon_onnx = os.path.join(workdir, f"{base}.canon.onnx")
-    original_mnn = os.path.join(workdir, f"{base}.original.mnn")
-    fused_mnn = os.path.join(workdir, f"{base}.fused.mnn")
+    optimized_onnx = os.path.join(workdir, f"{base}.optimized.onnx")
     report = os.path.join(workdir, f"{base}.mnnforge.report.json")
 
     # ---- Phase 1
     if args.skip_canonicalize:
-        log.info("phase 1 skipped (--skip-canonicalize); using onnx as-is")
+        log.info("phase 1 skipped — using onnx as-is")
         canon_onnx = pre.onnx_path
     else:
-        canonicalize(
-            pre.mnn_root, pre.onnx_path, canon_onnx, log,
-            verify=not args.no_ort_verify_canon,
-        )
+        canonicalize(pre.mnn_root, pre.onnx_path, canon_onnx, log,
+                     verify=not args.no_ort_verify_canon)
 
-    # ---- Phase 2
-    log.phase(2, "convert ONNX -> MNN (stock MNNConvert)")
-    converter = ensure_converter(pre.mnn_root, log)
-    mnn_convert(converter, canon_onnx, original_mnn, log)
+    log.phase(2, "load + FSM on the ONNX graph")
+    model = onnx.load(canon_onnx)
+    patterns = mine(model, log, max_pattern_size=args.max_pattern_size)
 
-    # ---- Phases 3..6
-    if args.skip_fuse:
-        log.info("phases 3-6 skipped (--skip-fuse); fused = original")
-        fused_mnn = original_mnn
+    if not patterns:
+        log.warn("no fusable patterns discovered — nothing to emit")
+        if not (args.skip_rewrite or args.skip_emit):
+            onnx.save(model, optimized_onnx)
+            log.ok(f"copied canonical ONNX to {optimized_onnx}")
+        return 0
+
+    # ---- Phase 4
+    if args.skip_emit:
+        log.info("phase 4 skipped — analysis only")
+        emissions = []
     else:
-        log.phase(3, "parse .mnn flatbuffer")
-        netT, _raw, MNN = load_mnn(pre.mnn_root, original_mnn, log)
+        log.phase(4, "emit kernels + Execution classes into MNN tree")
+        emissions = emit_all(pre.mnn_root, patterns, args.top_n, log)
 
-        log.phase(4, "frequent subgraph mining")
-        patterns = mine(MNN, netT, log, max_pattern_size=args.max_pattern_size)
+    # ---- Phase 5
+    if args.skip_rewrite:
+        log.info("phase 5 skipped — not writing optimized ONNX")
+        n_fused = 0
+    else:
+        log.phase(5, "rewrite ONNX with custom-op nodes")
+        new_model, n_fused = rewrite_onnx(model, patterns, args.top_n, log)
+        onnx.save(new_model, optimized_onnx)
+        log.ok(f"wrote {optimized_onnx} ({n_fused} subgraph(s) replaced)")
 
-        if not patterns:
-            log.info("no fusable patterns discovered — fused = original")
-            fused_mnn = original_mnn
-        else:
-            log.phase(5, "synthesize OpenCL kernels")
-            log.phase(6, "rewrite .mnn op-spans -> OpType_Extra")
-            n = apply_patterns(MNN, netT, patterns, log, top_n=args.top_n)
-            if n == 0:
-                log.info("no occurrences fused — fused = original")
-                fused_mnn = original_mnn
-            else:
-                save_mnn(MNN, netT, fused_mnn, log)
-
-    # ---- Phase 7
+    # ---- Phase 6
     if args.skip_verify:
-        log.info("phase 7 skipped (--skip-verify)")
-        log.ok("done (no verification performed)")
+        log.info("phase 6 skipped (--skip-verify)")
+        log.ok("done")
         return 0
 
-    ok = verify(canon_onnx, original_mnn, fused_mnn, report, log,
-                atol=args.atol, rtol=args.rtol)
-    if ok:
-        log.ok("verification PASSED — fused model is numerically equivalent")
-        return 0
-    log.err("verification FAILED — see report for details: " + report)
-    return 2
+    if not args.skip_rewrite:
+        ok = verify_structural(canon_onnx, optimized_onnx, report, log)
+        if ok:
+            log.ok("structural verification PASSED")
+            log.info("Next: build MNN, then run "
+                     f"`MNNConvert -f ONNX --modelFile {optimized_onnx} "
+                     "--MNNModel out.mnn`")
+            return 0
+        log.err(f"structural verification FAILED — see {report}")
+        return 2
+
+    log.ok("done")
+    return 0

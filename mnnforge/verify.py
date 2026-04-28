@@ -1,233 +1,167 @@
-"""Phase 7 — verify ORT(canonical onnx) vs MNN(.mnn) on OpenCL backend.
+"""Phase 6 — structural verification.
 
-Bug fixes (vs first draft) tagged BUGFIX-V-NN:
-   1: pymnn placeholder takes (shape, format[, dtype]); F.float was wrong.
-   2: var.write(numpy_array) — NOT .tobytes().
-   3: var.read() returns ndarray; call once.
-   4: OpenCL output may be in NC4HW4 layout; F.convert(out, F.NCHW) before read.
-   5: net.forward() may return a single var or list — normalize.
-  15: keep dynamic-dim defaults reasonable AND pass the same array to ORT
-      and MNN (dict shared, not regenerated).
-  16: ascontiguousarray to avoid implicit copies losing dtype/strides.
-  17: graceful CPU fallback when OpenCL unavailable (e.g. macOS arm).
-  18: shape-mismatch resilience: try a reshape before declaring fail.
-  19: skip 2nd MNN run if fused == original.
-  20: never silently report success when nothing actually compared.
-  22: dirname-or-cwd guard for the report path.
+The new flow can't run the optimized ONNX through ONNX Runtime because the
+custom-op nodes have an unknown op_type. We verify what we can:
+
+  1. Canonical ONNX still passes onnx.checker.
+  2. Optimized ONNX still passes onnx.checker (custom domain ops skipped).
+  3. ORT executes the canonical ONNX without error (sanity baseline).
+  4. The set of graph outputs is unchanged between canonical and optimized.
+  5. Each fused custom-op node has the expected attributes & inputs/outputs.
+
+Numerical end-to-end verification (ORT vs MNN-OpenCL) is the user's
+responsibility AFTER they've built MNN and run MNNConvert against the
+optimized ONNX. mnnforge prints the exact command in the final log line.
 """
 from __future__ import annotations
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 import numpy as np
+import onnx
 
 from .log import Logger
-
-
-FORWARD_CPU = 0
-FORWARD_OPENCL = 3
+from .onnx_surgery import CUSTOM_DOMAIN
 
 
 @dataclass
-class CompareResult:
+class CheckResult:
     label: str
     ok: Optional[bool]
-    per_output: List[Dict] = field(default_factory=list)
-    note: str = ""
+    detail: str = ""
 
 
-def _make_random_inputs(spec_pairs: List[Tuple[str, Tuple, np.dtype]],
-                        seed: int = 0) -> Dict[str, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    out: Dict[str, np.ndarray] = {}
-    for name, shape, dtype in spec_pairs:
-        concrete = []
-        for i, d in enumerate(shape):
-            if isinstance(d, int) and d > 0:
-                concrete.append(d)
-            else:
-                concrete.append(1 if i == 0 else 32)   # BUGFIX-V-15
-        if np.issubdtype(dtype, np.floating):
-            arr = rng.standard_normal(size=concrete).astype(dtype)
-        elif np.issubdtype(dtype, np.integer):
-            arr = np.zeros(concrete, dtype=dtype)
+def _check_model(path: str, *, allow_custom: bool, log: Logger) -> CheckResult:
+    try:
+        m = onnx.load(path)
+    except Exception as e:
+        return CheckResult(f"load:{os.path.basename(path)}", False,
+                           f"{type(e).__name__}: {e}")
+    try:
+        if allow_custom:
+            shadow = onnx.ModelProto(); shadow.CopyFrom(m)
+            keep = [n for n in shadow.graph.node if n.domain != CUSTOM_DOMAIN]
+            del shadow.graph.node[:]
+            shadow.graph.node.extend(keep)
+            try:
+                onnx.checker.check_model(shadow, full_check=False)
+            except Exception as e:
+                return CheckResult(f"checker:{os.path.basename(path)}",
+                                   False, str(e).splitlines()[0][:200])
         else:
-            arr = np.zeros(concrete, dtype=dtype)
-        out[name] = np.ascontiguousarray(arr)            # BUGFIX-V-16
-    return out
+            onnx.checker.check_model(m)
+    except Exception as e:
+        return CheckResult(f"checker:{os.path.basename(path)}", False,
+                           str(e).splitlines()[0][:200])
+    return CheckResult(f"checker:{os.path.basename(path)}", True,
+                       f"{len(m.graph.node)} nodes, "
+                       f"{len(m.graph.initializer)} initializers")
 
 
-def _run_ort(onnx_path: str, log: Logger
-             ) -> Optional[Tuple[List[np.ndarray], Dict[str, np.ndarray], List[str]]]:
+def _ort_smoke(path: str, log: Logger) -> CheckResult:
     try:
         import onnxruntime as ort
     except ImportError:
-        log.warn("onnxruntime missing — cannot establish ORT ground truth")
-        return None
-    so = ort.SessionOptions()
-    so.log_severity_level = 3
+        return CheckResult("ort_smoke", None, "onnxruntime not installed")
+    so = ort.SessionOptions(); so.log_severity_level = 3
     try:
-        sess = ort.InferenceSession(onnx_path, sess_options=so,
+        sess = ort.InferenceSession(path, sess_options=so,
                                     providers=["CPUExecutionProvider"])
     except Exception as e:
-        log.err(f"ORT load failed for {onnx_path}: {e}")
-        return None
+        return CheckResult("ort_smoke", False, f"load: {e}")
+    rng = np.random.default_rng(0)
+    feeds: Dict[str, np.ndarray] = {}
     DTYPES = {
         "tensor(float)": np.float32, "tensor(float16)": np.float16,
         "tensor(double)": np.float64, "tensor(int8)": np.int8,
         "tensor(uint8)": np.uint8, "tensor(int32)": np.int32,
         "tensor(int64)": np.int64, "tensor(bool)": np.bool_,
     }
-    spec = [(i.name, tuple(i.shape), DTYPES.get(i.type, np.float32))
-            for i in sess.get_inputs()]
-    inputs = _make_random_inputs(spec)
-    out_names = [o.name for o in sess.get_outputs()]
-    try:
-        outs = sess.run(out_names, inputs)
-    except Exception as e:
-        log.err(f"ORT run failed: {e}")
-        return None
-    return outs, inputs, out_names
-
-
-def _run_mnn(mnn_path: str, inputs: Dict[str, np.ndarray],
-             out_names: List[str], log: Logger,
-             forward: int = FORWARD_OPENCL) -> Optional[List[np.ndarray]]:
-    try:
-        import MNN
-        import MNN.expr as F
-        from MNN import nn
-    except ImportError:
-        log.warn("pymnn not installed (`pip install MNN`) — skipping MNN run")
-        return None
-
-    config = {"backend": forward, "precision": "high"}
-    try:
-        rt = nn.create_runtime_manager((config,))
-        net = nn.load_module_from_file(
-            mnn_path,
-            list(inputs.keys()),
-            out_names,
-            runtime_manager=rt,
-        )
-    except Exception as e:
-        log.err(f"MNN load failed for {mnn_path} on backend={forward}: {e}")
-        if forward != FORWARD_CPU:                       # BUGFIX-V-17
-            log.warn("retrying on CPU backend for diagnostic comparison")
-            return _run_mnn(mnn_path, inputs, out_names, log, FORWARD_CPU)
-        return None
-
-    var_inputs = []
-    for name, arr in inputs.items():
-        v = F.placeholder(list(arr.shape), F.NCHW)       # BUGFIX-V-1
-        v.name = name
-        v.write(arr)                                     # BUGFIX-V-2
-        var_inputs.append(v)
-    try:
-        var_outputs = net.forward(var_inputs)
-    except Exception as e:
-        log.err(f"MNN forward failed: {e}")
-        return None
-    if not isinstance(var_outputs, (list, tuple)):       # BUGFIX-V-5
-        var_outputs = [var_outputs]
-
-    outs: List[np.ndarray] = []
-    for v in var_outputs:
-        v = F.convert(v, F.NCHW)                         # BUGFIX-V-4
-        arr = np.array(v.read(), copy=True)              # BUGFIX-V-3
-        outs.append(arr)
-    return outs
-
-
-def _compare(a_outs: List[np.ndarray], b_outs: List[np.ndarray],
-             names: List[str], atol: float, rtol: float
-             ) -> Tuple[bool, List[Dict]]:
-    if len(a_outs) != len(b_outs):
-        return False, [{"error": f"output count {len(a_outs)} vs {len(b_outs)}"}]
-    ok = True
-    rows: List[Dict] = []
-    for a, b, n in zip(a_outs, b_outs, names):
-        if a.shape != b.shape and a.size == b.size:      # BUGFIX-V-18
-            try:
-                b = b.reshape(a.shape)
-            except Exception:
-                pass
-        if a.shape != b.shape:
-            ok = False
-            rows.append({"output": n, "shape_a": list(a.shape),
-                         "shape_b": list(b.shape), "error": "shape mismatch"})
-            continue
-        a64 = a.astype(np.float64); b64 = b.astype(np.float64)
-        diff = np.abs(a64 - b64)
-        max_abs = float(diff.max() if diff.size else 0.0)
-        denom = np.maximum(np.abs(a64), np.abs(b64))
-        denom[denom == 0.0] = 1.0
-        rel = float((diff / denom).max() if diff.size else 0.0)
-        passed = bool(np.allclose(a64, b64, atol=atol, rtol=rtol))
-        ok = ok and passed
-        rows.append({"output": n, "shape": list(a.shape),
-                     "max_abs_err": max_abs, "max_rel_err": rel,
-                     "pass": passed})
-    return ok, rows
-
-
-def verify(canonical_onnx: str, original_mnn: str, fused_mnn: str,
-           report_path: str, log: Logger,
-           atol: float = 1e-3, rtol: float = 1e-3) -> bool:
-    log.phase(7, "verify ORT vs MNN-OpenCL (baseline + fused)")
-    ort_result = _run_ort(canonical_onnx, log)
-    if ort_result is None:
-        log.warn("no ORT ground truth — verification inconclusive")
-        return False
-    ort_outs, inputs, out_names = ort_result
-    log.ok(f"ORT produced {len(ort_outs)} output(s)")
-    results: List[CompareResult] = []
-
-    # Baseline.
-    mnn_outs = _run_mnn(original_mnn, inputs, out_names, log, FORWARD_OPENCL)
-    if mnn_outs is None:
-        results.append(CompareResult("baseline_ort_vs_mnn_original",
-                                     None, note="MNN run unavailable"))
-    else:
-        ok, rows = _compare(ort_outs, mnn_outs, out_names, atol, rtol)
-        results.append(CompareResult("baseline_ort_vs_mnn_original", ok, rows))
-        (log.ok if ok else log.warn)(
-            f"baseline ORT vs MNN(original): {'PASS' if ok else 'FAIL'}"
-        )
-
-    # Fused.
-    if os.path.realpath(fused_mnn) == os.path.realpath(original_mnn):  # BUGFIX-V-19
-        log.info("fused == original (no patterns applied); skipping 2nd run")
-    else:
-        fused_outs = _run_mnn(fused_mnn, inputs, out_names, log, FORWARD_OPENCL)
-        if fused_outs is None:
-            results.append(CompareResult("ort_vs_mnn_fused",
-                                         None, note="MNN run unavailable"))
+    for inp in sess.get_inputs():
+        shape = [d if isinstance(d, int) and d > 0 else (1 if i == 0 else 32)
+                 for i, d in enumerate(inp.shape)]
+        dtype = DTYPES.get(inp.type, np.float32)
+        if np.issubdtype(dtype, np.floating):
+            feeds[inp.name] = rng.standard_normal(size=shape).astype(dtype)
         else:
-            ok, rows = _compare(ort_outs, fused_outs, out_names, atol, rtol)
-            results.append(CompareResult("ort_vs_mnn_fused", ok, rows))
-            (log.ok if ok else log.err)(
-                f"fused ORT vs MNN(fused): {'PASS' if ok else 'FAIL'}"
-            )
+            feeds[inp.name] = np.zeros(shape, dtype=dtype)
+    try:
+        sess.run(None, feeds)
+    except Exception as e:
+        return CheckResult("ort_smoke", False, f"run: {e}")
+    return CheckResult("ort_smoke", True,
+                       f"{len(sess.get_inputs())} input(s), "
+                       f"{len(sess.get_outputs())} output(s)")
 
-    payload = {
-        "canonical_onnx": canonical_onnx,
-        "original_mnn": original_mnn, "fused_mnn": fused_mnn,
-        "atol": atol, "rtol": rtol,
-        "results": [
-            {"label": r.label, "ok": r.ok, "note": r.note,
-             "per_output": r.per_output} for r in results
-        ],
-    }
-    rep_dir = os.path.dirname(os.path.abspath(report_path)) or "."   # BUGFIX-V-22
+
+def _output_names_match(canonical: str, optimized: str) -> CheckResult:
+    a = onnx.load(canonical); b = onnx.load(optimized)
+    a_outs = [o.name for o in a.graph.output]
+    b_outs = [o.name for o in b.graph.output]
+    if a_outs == b_outs:
+        return CheckResult("output_names_match", True,
+                           f"{len(a_outs)} output(s) preserved")
+    return CheckResult("output_names_match", False, f"{a_outs} vs {b_outs}")
+
+
+def _custom_nodes_well_formed(optimized: str) -> CheckResult:
+    m = onnx.load(optimized)
+    expected_attrs = {"kernel_name", "op_kinds", "fingerprint"}
+    bad: List[str] = []
+    n = 0
+    for node in m.graph.node:
+        if node.domain != CUSTOM_DOMAIN:
+            continue
+        n += 1
+        keys = {a.name for a in node.attribute}
+        missing = expected_attrs - keys
+        if missing:
+            bad.append(f"{node.name}: missing {missing}")
+            continue
+        if not [t for t in node.input if t]:
+            bad.append(f"{node.name}: no inputs")
+        if len([t for t in node.output if t]) != 1:
+            bad.append(f"{node.name}: expected 1 output, "
+                       f"got {len(node.output)}")
+    if bad:
+        return CheckResult("custom_nodes_well_formed", False,
+                           "; ".join(bad[:5]))
+    return CheckResult("custom_nodes_well_formed", True,
+                       f"{n} custom node(s) present and well-formed")
+
+
+def verify_structural(canonical_onnx: str, optimized_onnx: str,
+                      report_path: str, log: Logger) -> bool:
+    log.phase(6, "structural verification")
+    results: List[CheckResult] = [
+        _check_model(canonical_onnx, allow_custom=False, log=log),
+        _check_model(optimized_onnx, allow_custom=True, log=log),
+        _ort_smoke(canonical_onnx, log),
+        _output_names_match(canonical_onnx, optimized_onnx),
+        _custom_nodes_well_formed(optimized_onnx),
+    ]
+    for r in results:
+        prefix = (log.ok if r.ok is True
+                  else log.err if r.ok is False
+                  else log.warn)
+        prefix(f"  [{r.label}] {r.detail}")
+
+    rep_dir = os.path.dirname(os.path.abspath(report_path)) or "."
     os.makedirs(rep_dir, exist_ok=True)
     with open(report_path, "w") as fh:
-        json.dump(payload, fh, indent=2)
+        json.dump({
+            "canonical": canonical_onnx,
+            "optimized": optimized_onnx,
+            "results": [
+                {"label": r.label, "ok": r.ok, "detail": r.detail}
+                for r in results
+            ],
+        }, fh, indent=2)
     log.ok(f"wrote {report_path}")
 
-    if all(r.ok is None for r in results):                # BUGFIX-V-20
-        log.warn("verification inconclusive (no comparisons could run)")
+    if all(r.ok is None for r in results):
+        log.warn("all checks inconclusive (deps missing)")
         return False
-    return all(r.ok is True for r in results)
+    return all(r.ok is True for r in results if r.ok is not None)

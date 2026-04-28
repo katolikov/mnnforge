@@ -1,8 +1,7 @@
 # HOWTO — Using mnnforge end-to-end
 
-A practical, step-by-step guide. If something here looks wrong, see the
-[Troubleshooting](#troubleshooting) section at the bottom — most issues map to a single,
-known failure mode.
+A step-by-step guide. If something looks wrong, jump to
+[Troubleshooting](#10-troubleshooting) at the bottom.
 
 ---
 
@@ -10,13 +9,13 @@ known failure mode.
 
 1. [Prerequisites](#1-prerequisites)
 2. [Install](#2-install)
-3. [First run](#3-first-run)
-4. [Reading the output](#4-reading-the-output)
-5. [Tuning fusion](#5-tuning-fusion)
-6. [CI / scripted use](#6-ci--scripted-use)
-7. [Verifying that fusion actually ran](#7-verifying-that-fusion-actually-ran)
-8. [Performance check (timing the fused .mnn)](#8-performance-check-timing-the-fused-mnn)
-9. [Iterating on a model](#9-iterating-on-a-model)
+3. [First run (one-shot)](#3-first-run-one-shot)
+4. [What lands where](#4-what-lands-where)
+5. [Build MNN](#5-build-mnn)
+6. [Convert the optimized ONNX](#6-convert-the-optimized-onnx)
+7. [Verify end-to-end](#7-verify-end-to-end)
+8. [Tuning fusion](#8-tuning-fusion)
+9. [Rollback](#9-rollback)
 10. [Troubleshooting](#10-troubleshooting)
 11. [FAQ](#11-faq)
 
@@ -26,16 +25,10 @@ known failure mode.
 
 | Requirement | Why | How to get |
 |---|---|---|
-| Python ≥ 3.9 | runs `mnnforge` itself | system / pyenv |
-| MNN source tree | `mnnforge` builds `MNNConvert` from it and uses its `flatc` | `git clone https://github.com/alibaba/MNN` |
-| C++ toolchain (cmake + ninja or make) | builds `MNNConvert` and `flatc` once | Xcode CLT / build-essential |
-| `pip install onnx onnxruntime flatbuffers numpy networkx` | core deps | `pip install -r requirements.txt` |
-| `pip install MNN` (pymnn) | only required for Phase 7 verification | `pip install MNN` |
-| OpenCL drivers | optional; without them, verify falls back to CPU | platform-specific |
-
-> On macOS Apple Silicon, OpenCL is deprecated. `mnnforge` will gracefully fall back to the
-> MNN CPU backend for verification; the fused `.mnn` itself is portable and will run on
-> OpenCL on devices that support it.
+| Python ≥ 3.9 | runs `mnnforge` | system / pyenv |
+| MNN source tree | mnnforge writes into `source/backend/opencl/...` | `git clone https://github.com/alibaba/MNN` |
+| C++ toolchain (CMake + ninja or make) | builds MNN itself afterwards | Xcode CLT / build-essential |
+| Python deps | `pip install -r requirements.txt` | onnx, onnxruntime, numpy |
 
 ---
 
@@ -45,249 +38,246 @@ known failure mode.
 git clone https://github.com/katolikov/mnnforge
 cd mnnforge
 
-python3 -m venv .venv && source .venv/bin/activate    # optional but recommended
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-pip install MNN                                       # for verification
 ```
 
-Verify the install:
+Verify:
 
 ```bash
-python -m mnnforge --version
-# → mnnforge 0.1.0
-python -m pytest tests/ -q
-# → 46 passed
+python -m mnnforge --version              # mnnforge 0.2.0
+python -m pytest tests/ -q                # 42 passed
 ```
 
 ---
 
-## 3. First run
-
-Pick any ONNX model. A small ImageNet classifier or a snippet of a transformer is ideal —
-`mnnforge` is most useful on models with repeated motifs.
+## 3. First run (one-shot)
 
 ```bash
 python -m mnnforge /path/to/MNN ./model.onnx -v
 ```
 
-What happens, in order:
+What happens:
 
-| Phase | What's printed | Output produced |
-|------:|---|---|
+| Phase | What's printed | Output |
+|---:|---|---|
 | 0 | preflight checks | — |
 | 1 | `[pass] prelu / fold_unary / negative_axes / dead_init` | `model.canon.onnx` |
-| 2 | `building MNNConvert` (first run only) → `running MNNConvert` | `model.original.mnn` |
-| 3 | `parsed ... ops, ... tensors` | (in-memory NetT) |
-| 4 | `pattern <fp>: 12× len=3 score=24 [BinaryOp(2,pos=0) → ...]` | (table) |
-| 5 | `synthesized kernel 'mnnforge_<fp>'` | (in-memory) |
-| 6 | `fused N occurrence(s); ops 230 -> 195` | `model.fused.mnn` |
-| 7 | `baseline ORT vs MNN(original): PASS` then `fused ORT vs MNN(fused): PASS` | `model.mnnforge.report.json` |
+| 2 | `pattern <fp>: 12× len=3 score=24 [BinaryOp(2,pos=0) → ...]` | (table) |
+| 3 | (kernel synthesis is silent unless `-v`) | (in-memory) |
+| 4 | `emitted source/backend/opencl/execution/cl/mnnforge_<fp>.cl` ×N, `patched FuseExecution.cpp` | files in MNN tree |
+| 5 | `wrote model.optimized.onnx (18 subgraph(s) replaced)` | `model.optimized.onnx` |
+| 6 | `[checker:..] OK`, `[ort_smoke] OK`, `[output_names_match] OK`, `[custom_nodes_well_formed] N custom node(s)` | `model.mnnforge.report.json` |
 
-Exit code is `0` if both comparisons in Phase 7 pass, `2` otherwise.
-
----
-
-## 4. Reading the output
-
-```bash
-cat model.mnnforge.report.json | python -m json.tool
-```
-
-Each entry has:
-
-* `label` — `baseline_ort_vs_mnn_original` (sanity, stock conversion path) or
-  `ort_vs_mnn_fused` (the actual test that fusion is correct)
-* `ok` — `true` / `false` / `null` (null = run was skipped / unavailable)
-* `per_output` — one row per output tensor with `max_abs_err`, `max_rel_err`, `shape`, `pass`
-
-If `baseline_ort_vs_mnn_original.ok` is `false`, your model has a stock-MNNConvert issue —
-not an `mnnforge` issue. Re-run with `--skip-fuse` to confirm and report it upstream.
+Exit code 0 if Phase 6 passes.
 
 ---
 
-## 5. Tuning fusion
+## 4. What lands where
+
+**Next to your ONNX file** (in `--workdir DIR` if you set one):
+
+```
+model.canon.onnx
+model.optimized.onnx
+model.mnnforge.report.json
+```
+
+**Inside the MNN tree**, all auto-generated:
+
+```
+source/backend/opencl/execution/cl/mnnforge_<fp>.cl                  ← kernel source
+source/backend/opencl/execution/cl/mnnforge_<fp>_mnn_cl.cpp          ← string blob
+source/backend/opencl/execution/cl/opencl_source_map.hpp             ← regenerated
+source/backend/opencl/execution/image/MnnForge<Fp>Execution.hpp      ← class header
+source/backend/opencl/execution/image/MnnForge<Fp>Execution.cpp      ← class impl
+source/backend/opencl/execution/image/FuseExecution.cpp              ← patched
+source/backend/opencl/execution/image/FuseExecution.cpp.mnnforge.bak ← restore copy
+```
+
+The `MNNFORGE-BEGIN`/`MNNFORGE-END` markers in `FuseExecution.cpp` make the patch easy
+to spot in `git diff` and trivially safe to re-apply on re-runs.
+
+You should also add the generated paths to your local MNN `.gitignore` if you don't want
+them tracked. They're regenerated on every `mnnforge` invocation.
+
+---
+
+## 5. Build MNN
+
+A normal MNN build picks up the new files automatically — no extra flags needed.
 
 ```bash
-# Default
-python -m mnnforge /path/to/MNN model.onnx
-
-# Be greedier:
-python -m mnnforge /path/to/MNN model.onnx \
-    --top-n 8 \
-    --max-pattern-size 8
-
-# Be conservative:
-python -m mnnforge /path/to/MNN model.onnx \
-    --top-n 1 \
-    --max-pattern-size 3
+cd /path/to/MNN
+mkdir -p build && cd build
+cmake .. -DMNN_OPENCL=ON -DMNN_BUILD_CONVERTER=ON -DCMAKE_BUILD_TYPE=Release
+make -j
 ```
+
+If the build fails complaining about a generated file, run `mnnforge --rollback` and check
+the error against the templates in `mnn_emit.py`.
+
+---
+
+## 6. Convert the optimized ONNX
+
+Use the freshly built `MNNConvert`:
+
+```bash
+./MNNConvert \
+    -f ONNX \
+    --modelFile /path/to/model.optimized.onnx \
+    --MNNModel  /path/to/model.mnn \
+    --bizCode mnn
+```
+
+MNN's default ONNX importer auto-wraps the `MnnForge_<fp>` custom-domain nodes as
+`OpType_Extra` with `extra.type = "MnnForge_<fp>"`. The patched `FuseExecution.cpp`
+recognizes that prefix and dispatches to your generated `MnnForge<Fp>Execution`.
+
+---
+
+## 7. Verify end-to-end
+
+Run the original `.mnn` (built from the un-optimized ONNX) and the fused `.mnn` against
+ONNX Runtime as ground truth:
+
+```bash
+# Build a stock .mnn for comparison (one-time)
+./MNNConvert -f ONNX --modelFile /path/to/model.canon.onnx \
+                     --MNNModel  /path/to/model.original.mnn \
+                     --bizCode mnn
+```
+
+A simple comparison harness:
+
+```python
+import numpy as np, onnxruntime as ort, MNN
+import MNN.expr as F
+
+inputs = {"x": np.random.randn(1, 3, 224, 224).astype(np.float32)}
+
+# ORT
+sess = ort.InferenceSession("model.canon.onnx",
+                            providers=["CPUExecutionProvider"])
+ref = sess.run(None, inputs)[0]
+
+# MNN OpenCL
+rt  = MNN.nn.create_runtime_manager(({"backend": 3, "precision": "high"},))
+net = MNN.nn.load_module_from_file("model.mnn", ["x"], ["y"], runtime_manager=rt)
+v = F.placeholder(list(inputs["x"].shape), F.NCHW); v.write(inputs["x"])
+out = F.convert(net.forward([v])[0], F.NCHW).read()
+
+print("max abs err:", float(np.abs(ref - out).max()))
+```
+
+Tolerable max-abs-err on fp32 is typically `1e-3` to `5e-3`.
+
+---
+
+## 8. Tuning fusion
 
 | Flag | Default | Effect |
 |---|---:|---|
-| `--top-n N` | 4 | Apply only the N highest-scoring patterns. Each pattern can have many occurrences. |
-| `--max-pattern-size K` | 6 | Don't extend a chain beyond K ops. Larger values → fewer but more aggressive kernels. |
-| `--atol` | 1e-3 | Absolute tolerance in Phase 7 comparisons (fp32). |
-| `--rtol` | 1e-3 | Relative tolerance. |
-
----
-
-## 6. CI / scripted use
+| `--top-n N` | 4 | Apply only the N highest-scoring patterns |
+| `--max-pattern-size K` | 6 | Don't extend a chain beyond K ops |
 
 ```bash
-python -m mnnforge /path/to/MNN model.onnx \
-    --no-ort-verify-canon \
-    --workdir build/mnnforge_artifacts \
-    --verbose
-echo "exit=$?"
+# Aggressive
+python -m mnnforge /path/to/MNN model.onnx --top-n 8 --max-pattern-size 8
+
+# Conservative (one pattern, length ≤ 3)
+python -m mnnforge /path/to/MNN model.onnx --top-n 1 --max-pattern-size 3
+
+# Analysis only (no MNN tree edits, no ONNX rewrite)
+python -m mnnforge /path/to/MNN model.onnx --skip-emit --skip-rewrite
 ```
-
-* `--no-ort-verify-canon` — skip the per-pass ORT verification *inside* canonicalize
-  (Phase 1). The end-to-end Phase 7 still runs and protects you.
-* `--workdir DIR` — keep all artifacts in one folder (handy for upload).
-* `--skip-build` is **not** a flag (we never have a flag named that); the `MNNConvert`
-  build is cached in `build_mnnforge/` inside your MNN tree.
-
-Exit codes:
-
-| Code | Meaning |
-|---:|---|
-| 0 | All Phase 7 comparisons passed within tolerance. |
-| 2 | One or more comparisons failed, or all comparisons inconclusive. |
-| nonzero, not 2 | Hard error — see stderr (preflight refusal, MNNConvert build crash, parse error). |
 
 ---
 
-## 7. Verifying that fusion actually ran
+## 9. Rollback
 
-The most reliable signal is the op count change at the end of Phase 6:
-
-```
-[ ✓ ] fused 18 occurrence(s); ops 230 -> 195
-```
-
-You can also inspect the `.mnn` flatbuffer:
+To revert all MNN-tree edits and remove every `mnnforge_<fp>.cl` /
+`MnnForge<Fp>Execution.{hpp,cpp}` file:
 
 ```bash
-python3 - <<'PY'
-import sys
-sys.path.insert(0, "/path/to/MNN/build_mnnforge/_mnn_py_fbs")
-from MNN.Net import Net
-from MNN.OpType import OpType
-import os
-
-raw = open("model.fused.mnn", "rb").read()
-net = Net.GetRootAs(bytearray(raw), 0)
-n_extra = sum(1 for i in range(net.OplistsLength())
-              if net.Oplists(i).Type() == OpType.Extra)
-print(f"OpType_Extra count in fused.mnn: {n_extra}")
-PY
+python -m mnnforge /path/to/MNN --rollback
 ```
 
-If `n_extra == 0`, no patterns met the score threshold — try `--max-pattern-size 8 --top-n 8`.
+This:
 
----
+* restores `FuseExecution.cpp` from `.mnnforge.bak`
+* removes every `mnnforge_*.cl` and `*_mnn_cl.cpp`
+* removes every `MnnForge*Execution.{hpp,cpp}`
+* re-runs `opencl_codegen.py` so `opencl_source_map.hpp` is consistent
 
-## 8. Performance check (timing the fused .mnn)
-
-`mnnforge` does not time models itself — that's MNN's `MNNV2Basic.out` job. After a successful
-fusion run:
-
-```bash
-# Inside the MNN tree:
-./build_mnnforge/MNNV2Basic.out model.original.mnn 100 0 0 3 4   # backend=3 (OpenCL)
-./build_mnnforge/MNNV2Basic.out model.fused.mnn    100 0 0 3 4
-```
-
-Compare the average forward times. Speedups vary widely:
-
-* CNNs with many small `BatchNorm + ReLU` chains: 5–15% wall-clock improvement
-* Transformers with repeated `Mul / Add / Sigmoid` patterns: 10–20%
-* Models with no repeated elementwise motifs: ~0% (and that's fine — `mnnforge` exits with
-  "no patterns discovered")
-
----
-
-## 9. Iterating on a model
-
-If a fused model fails Phase 7:
-
-1. Check the report JSON. If only one specific output diverges, the offending pattern is
-   feeding into that output. Re-run with `--top-n 1` to narrow down.
-2. If `baseline_ort_vs_mnn_original` already fails, the divergence is **not** from `mnnforge`
-   — it's a stock MNN converter issue. File it against MNN.
-3. If `--max-pattern-size 2` passes but `--max-pattern-size 6` fails, a long chain has
-   accumulated rounding error past `--atol`. Loosen tolerance with `--atol 5e-3 --rtol 5e-3`
-   or shrink the chain limit.
-4. If `pymnn` isn't installed or OpenCL isn't available, you'll see `ok: null` results and an
-   inconclusive verdict. Install `pip install MNN` and retry.
+`git status` should now report a clean MNN tree.
 
 ---
 
 ## 10. Troubleshooting
 
 ### `cmake not found in PATH`
-Install CMake (`brew install cmake` / `apt install cmake`). The first run builds `MNNConvert`.
+Install CMake (`brew install cmake` / `apt install cmake`).
 
-### `MNN load failed for ... on backend=3`
-OpenCL ICD missing or your GPU doesn't expose OpenCL. `mnnforge` automatically retries on
-CPU; the report will be labeled accordingly. The fused `.mnn` itself is still correct and
-portable to any device with OpenCL.
+### `opencl_codegen.py failed (rc=N)`
+The generated `.cl` has invalid OpenCL syntax (rare with v1's snippet library).
+Check the offending file in `source/backend/opencl/execution/cl/` and the stderr emitted
+above. Open an issue with the report.json attached.
 
-### `MNNConvert returned 0 but model.original.mnn missing`
-You probably ran out of disk space or ran with insufficient permissions in the workdir.
+### MNN build fails on a generated file
+A generated `Execution` class doesn't compile against your specific MNN revision.
+Run `mnnforge --rollback`, file an issue with the MNN commit hash.
 
-### `flatc build did not produce ...`
-The vendored flatbuffers source under `<mnn_root>/3rd_party/flatbuffers/` is incomplete or
-its `CMakeLists.txt` is out of sync. Run `<mnn_root>/schema/generate.sh` once manually to
-prime it.
+### `[ort_smoke] failed to run`
+Your *canonical* ONNX is broken — likely a Phase 1 pass changed something it shouldn't
+have. Re-run with `--no-ort-verify-canon` to see Phase 1's report and report against the
+specific pass.
 
-### `verification inconclusive`
-Either `onnxruntime` or `MNN` (pymnn) couldn't be imported, so we have no reference to
-compare against. `pip install onnxruntime MNN` and retry.
-
-### `no fusable patterns discovered — fused = original`
-Your model has no repeating elementwise motifs of length ≥ 2. That's normal for very small
-models. Try `--max-pattern-size 3` to lower the bar, or accept that there's nothing for
-`mnnforge` to do.
+### `no fusable patterns discovered`
+Your model has no repeating elementwise motifs of length ≥ 2 (some classical CNNs).
+Try `--max-pattern-size 3` to lower the bar, or accept that there's nothing to do.
 
 ### `mnn_root missing required path: source/backend/opencl/...`
-The path you passed isn't an MNN source tree, or you cloned a partial checkout. `mnnforge`
-also refuses to run if it would need to touch `schema/private/` or `source/internal/`.
+The path you passed isn't an MNN tree, or the tree is too old (pre-OpenCL backend).
+
+### Patched `FuseExecution.cpp` doesn't compile
+The `MNNFORGE-BEGIN/END` block is bracketed for safety. If your MNN revision changed the
+namespace declaration order, the patch's anchor (`namespace MNN`) may be wrong. Run
+`mnnforge --rollback` and file an issue with the diff context.
 
 ---
 
 ## 11. FAQ
 
-**Q: Does `mnnforge` modify the MNN source tree?**
-No. The only things it writes inside the tree are: a `build_mnnforge/` directory with the
-`MNNConvert` binary (built once) and `_mnn_py_fbs/` with auto-generated Python flatbuffer
-bindings (cached). Both are listed in `.gitignore`-equivalent paths and can be deleted at
-any time.
+**Q: Does mnnforge modify MNN source?**
+Yes. Inside `source/backend/opencl/execution/cl/` and
+`source/backend/opencl/execution/image/`. `--rollback` reverses every edit. Files are clearly
+marked auto-generated and the `FuseExecution.cpp` patch is bracketed by
+`MNNFORGE-BEGIN/MNNFORGE-END`.
 
-**Q: Will the fused `.mnn` file load on stock MNN binaries that don't have `mnnforge`
-installed?**
-Yes. The fused model uses only `OpType_Extra` (= 512), which is a first-class op in the
-public schema. Any MNN ≥ 3.0 with the OpenCL backend will load and run it.
+**Q: Will the resulting `.mnn` file load on stock MNN binaries that don't have my
+mnnforge-built MNN?**
+**No.** Unlike the post-processor design, the runtime now expects the generated
+`Execution` classes to be linked into the MNN binary. You ship your patched MNN alongside
+your `.mnn` files.
 
-**Q: What about Metal / Vulkan / CUDA?**
-The runtime fuse path exists in those backends too (`MetalFuse.mm`, `VulkanFuse.cpp`,
-`FuseExecutionV2.cu`), but each expects a backend-specific kernel. v1 of `mnnforge`
-generates only OpenCL. Multi-backend kernel generation is the highest-priority follow-up.
+**Q: Can I commit the generated files into my MNN fork?**
+Yes — they're plain C++ and `.cl`. Add them to your fork's tracked files; rebuild as
+normal.
 
-**Q: Is the FlatBuffer mutation safe across MNN versions?**
-`mnnforge` regenerates the Python bindings from `<mnn_root>/schema/default/*.fbs` on every
-run (cached by mtime), so it always matches the schema of the MNN tree you point it at. Pin
-your MNN version with a git submodule and you're set.
+**Q: Does the dispatch patch in `FuseExecution.cpp` add overhead at runtime?**
+No measurable overhead. It's a string compare per `OpType_Extra` op at session creation
+time, then the right `Execution` is cached.
 
-**Q: Why not just write a C++ pass inside MNN's own `tools/converter/source/optimizer/`?**
-That was the original plan. We discovered MNN already ships a runtime kernel-compilation
-path (`OpType_Extra` + `FuseExecution`) and decided that operating purely on the FlatBuffer
-gives you: zero MNN code changes, zero schema collisions, zero rebuild churn when adding new
-patterns, and a tool that works against any modern MNN release without forking. The trade-off
-is that `mnnforge` only fuses things that MNN's runtime can already execute via `FuseExecution`'s
-calling convention — which is precisely what we wanted v1 to scope to anyway.
+**Q: What if MNN already fuses this pattern internally (e.g. LayerNorm)?**
+mnnforge's snippet library covers BinaryOp/UnaryOp/Relu only; it never matches
+LayerNorm/Attention/etc. shapes that MNN already fuses via `Fuse*.cpp` passes.
+
+**Q: Will mnnforge handle Vulkan / Metal / CUDA next?**
+Roadmap. The runtime fuse path exists in those backends (`MetalFuse.mm`,
+`VulkanFuse.cpp`, `FuseExecutionV2.cu`); v1 emits OpenCL only.
 
 **Q: Where do I report bugs?**
-Open an issue on this repo with the `*.mnnforge.report.json` and the exact command line.
-If it's an MNN converter issue (i.e. `baseline_ort_vs_mnn_original.ok == false`), file it
-against `alibaba/MNN` instead.
+Open an issue with the `*.mnnforge.report.json` and the exact command line. If it's an
+MNN converter issue, file it against `alibaba/MNN`.
