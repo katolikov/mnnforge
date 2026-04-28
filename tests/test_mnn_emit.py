@@ -157,6 +157,29 @@ def test_emit_all_runs_real_codegen(real_sandbox):
     ))
 
 
+def test_emit_all_writes_cpu_stub(real_sandbox):
+    """Aligns mnnforge with MNN's add-new-op SKILL step 3 (CPU is the
+    universal fallback). Without this, MNN's GeometryComputerUtils const-
+    folder fails on backup CPU backend, and the model can't run on
+    backends other than OpenCL."""
+    # Make sure source/backend/cpu/ is present in the sandbox.
+    cpu_dir = os.path.join(real_sandbox, "source/backend/cpu")
+    os.makedirs(cpu_dir, exist_ok=True)
+
+    emissions = mnn_emit.emit_all(real_sandbox, [_pattern()], top_n=4,
+                                   log=Logger(verbose=False))
+    cpath = os.path.join(cpu_dir, "MnnForgeCPU.cpp")
+    assert os.path.exists(cpath), "MnnForgeCPU.cpp not emitted"
+    body = open(cpath).read()
+    # Registers as the CPU creator for OpType_Extra.
+    assert "REGISTER_CPU_OP_CREATOR(MnnForgeCPUCreator, OpType_Extra)" in body
+    # Returns nullptr for non-MnnForge Extra ops (preserves existing
+    # behaviour for other Extra users).
+    assert 'rfind("MnnForge_", 0) != 0' in body
+    # Reads op_kinds from extra->attr.
+    assert '"op_kinds"' in body
+
+
 def test_emit_all_writes_onnx_converter(real_sandbox):
     """The fix for the 'These Op Not Support' error — engine='MNN' converter."""
     emissions = mnn_emit.emit_all(real_sandbox, [_pattern()], top_n=4,
@@ -177,7 +200,7 @@ def test_rollback_restores_real_files(real_sandbox):
     mnn_emit.emit_all(real_sandbox, [_pattern()], top_n=4,
                      log=Logger(verbose=False))
     n = mnn_emit.rollback(real_sandbox, Logger(verbose=False))
-    assert n >= 4   # 1 .cl + 1 _mnn_cl.cpp + 1 .hpp + 1 .cpp + 1 onnx converter
+    assert n >= 5   # 1 .cl + 1 _mnn_cl.cpp + 1 .hpp + 1 .cpp + onnx + cpu stub
     fuse = open(os.path.join(
         real_sandbox, "source/backend/opencl/execution/image/FuseExecution.cpp"
     )).read()

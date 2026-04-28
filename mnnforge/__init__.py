@@ -3,4 +3,4 @@
 The package exposes one public entry point (`run_pipeline`) and a CLI
 (`python -m mnnforge`).
 """
-__version__ = "0.2.3"
+__version__ = "0.2.4"
