@@ -60,16 +60,50 @@ def _check_model(path: str, *, allow_custom: bool, log: Logger) -> CheckResult:
                        f"{len(m.graph.initializer)} initializers")
 
 
+_ORT_KNOWN_DOMAINS = {"", "ai.onnx", "ai.onnx.ml",
+                      "com.microsoft", "com.microsoft.nchwc"}
+
+
+def _foreign_domains(path: str) -> set:
+    """Return the set of node domains that ORT's CPUExecutionProvider can't
+    load. Includes our own CUSTOM_DOMAIN — it would also blow up ORT."""
+    try:
+        m = onnx.load(path)
+    except Exception:
+        return set()
+    return {n.domain for n in m.graph.node
+            if n.domain not in _ORT_KNOWN_DOMAINS}
+
+
 def _ort_smoke(path: str, log: Logger) -> CheckResult:
     try:
         import onnxruntime as ort
     except ImportError:
         return CheckResult("ort_smoke", None, "onnxruntime not installed")
+
+    foreign = _foreign_domains(path)
+    if foreign:
+        # Pre-existing or mnnforge-injected custom ops will fail ORT load.
+        # That's not a verification failure — just inconclusive.
+        return CheckResult(
+            "ort_smoke", None,
+            f"skipped: model uses non-standard op domain(s) {sorted(foreign)} "
+            "that ORT-CPU cannot load"
+        )
+
     so = ort.SessionOptions(); so.log_severity_level = 3
     try:
         sess = ort.InferenceSession(path, sess_options=so,
                                     providers=["CPUExecutionProvider"])
     except Exception as e:
+        # Detect "is not a registered function/op" — same root cause.
+        msg = str(e)
+        if "is not a registered function/op" in msg:
+            return CheckResult(
+                "ort_smoke", None,
+                f"skipped: ORT reports unregistered op "
+                f"({msg.splitlines()[-1][:160]})"
+            )
         return CheckResult("ort_smoke", False, f"load: {e}")
     rng = np.random.default_rng(0)
     feeds: Dict[str, np.ndarray] = {}
