@@ -139,6 +139,7 @@ def _graph_boundary_tensor_names(graph: onnx.GraphProto) -> Set[str]:
 def _find_chains(graph: onnx.GraphProto, max_len: int) -> List[Chain]:
     consumers, counts, _producer = _build_consumer_index(graph)
     output_names = {o.name for o in graph.output}
+    initializer_names = {i.name for i in graph.initializer}
     used = [False] * len(graph.node)
     chains: List[Chain] = []
 
@@ -204,6 +205,19 @@ def _find_chains(graph: onnx.GraphProto, max_len: int) -> List[Chain]:
             last_idx = cons_idx
 
         if len(steps) >= 2:
+            # BUGFIX: refuse chains whose boundary inputs are ALL graph
+            # initializers (constants). MNN's GeometryComputerUtils
+            # marks such ops as Schedule::CONSTANT and tries to evaluate
+            # them on a CPU backup backend at session-creation time.
+            # Since OpType_Extra has no CPU implementation, MNN logs
+            # "Don't support type [Extra]" + "Const Folder Error".
+            # Such chains have a deterministic output anyway and would
+            # be const-folded into a Const op by MNN's optimizer if we
+            # didn't fuse them — fusing buys nothing.
+            if boundary_inputs and all(
+                t in initializer_names for t in boundary_inputs
+            ):
+                continue
             for s in steps:
                 used[s.onnx_idx] = True
             outs = [t for t in last_node.output if t]

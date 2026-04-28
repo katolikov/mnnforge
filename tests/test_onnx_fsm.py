@@ -140,6 +140,52 @@ def test_max_pattern_size_capping():
             assert len(occ.steps) <= 3
 
 
+def test_all_const_chain_rejected():
+    """Chains whose boundary inputs are ALL initializers must NOT be fused.
+    MNN's GeometryComputerUtils tries to constant-fold such ops via the CPU
+    backend; OpType_Extra has no CPU impl and produces 'Don't support type
+    [Extra]' + 'Const Folder Error' at session-creation time."""
+    import numpy as np
+    from onnx import numpy_helper
+    a_init = numpy_helper.from_array(np.array([[1.0, 2.0]], dtype=np.float32),
+                                     name="a_const")
+    b_init = numpy_helper.from_array(np.array([[3.0, 4.0]], dtype=np.float32),
+                                     name="b_const")
+    nodes = [
+        helper.make_node("Mul", ["a_const", "b_const"], ["c"], name="n1"),
+        helper.make_node("Sigmoid", ["c"], ["y"], name="n2"),
+    ]
+    g = helper.make_graph(nodes, "t", [], [_output("y", (1, 2))],
+                          initializer=[a_init, b_init])
+    m = helper.make_model(g, producer_name="t")
+    m.opset_import[0].version = 17
+    patterns = mine(m, Logger(verbose=False))
+    # Even though Mul→Sigmoid is a perfect 2-step chain, both inputs are
+    # constants → MNN would try to const-fold at session creation. Refuse.
+    assert sum(len(p.occurrences) for p in patterns) == 0
+
+
+def test_partially_const_chain_still_fused():
+    """If at least one input is dynamic (graph input), the chain IS fusable —
+    no const-fold attempt happens."""
+    import numpy as np
+    from onnx import numpy_helper
+    bias = numpy_helper.from_array(np.array([1.0, 2.0], dtype=np.float32),
+                                   name="bias")
+    nodes = [
+        helper.make_node("Mul", ["x", "bias"], ["c"], name="n1"),
+        helper.make_node("Sigmoid", ["c"], ["y"], name="n2"),
+    ]
+    g = helper.make_graph(nodes, "t",
+                          [_input("x", (1, 2))],
+                          [_output("y", (1, 2))],
+                          initializer=[bias])
+    m = helper.make_model(g, producer_name="t")
+    m.opset_import[0].version = 17
+    patterns = mine(m, Logger(verbose=False))
+    assert sum(len(p.occurrences) for p in patterns) == 1
+
+
 def test_custom_domain_node_skipped():
     """A node already in our custom domain must not be re-mined."""
     n1 = helper.make_node("Sigmoid", ["a"], ["b"], name="n1")
